@@ -36,6 +36,14 @@ if ! command -v sbsign >/dev/null 2>&1; then
 	exit 5
 fi
 
+if [ -f "/boot/unified-image.efi" ]; then
+	cp /boot/unified-image.efi /boot/unified-image-old.efi
+fi
+
+if [ -f "/boot/efi/EFI/Linux/linux-signed.efi" ]; then
+	cp /boot/efi/EFI/Linux/linux-signed.efi /boot/efi/EFI/Linux/linux-signed-old.efi
+fi
+
 # If an initrd is generated, the update-initramfs post-update.d script will
 # invoke kernel-install instead.
 if [[ ${INITRD:-} != No ]]; then
@@ -43,20 +51,27 @@ if [[ ${INITRD:-} != No ]]; then
 	exit 0
 fi
 
-if [ -f "/boot/unified-image.efi" ]; then
-	mv /boot/unified-image.efi /boot/unified-image-old.efi
-fi
-
-if [ -f "/boot/efi/EFI/Linux/linux-signed.efi" ]; then
-	mv /boot/efi/EFI/Linux/linux-signed.efi /boot/efi/EFI/Linux/linux-signed-old.efi
-fi
+align="$(objdump -p /usr/lib/systemd/boot/efi/linuxx64.efi.stub | awk '{ if ($1 == "SectionAlignment"){print $2} }')"
+align=$((16#$align))
+osrel_offs="$(objdump -h "/usr/lib/systemd/boot/efi/linuxx64.efi.stub" | awk 'NF==7 {size=strtonum("0x"$3); offset=strtonum("0x"$4)} END {print size + offset}')"
+osrel_offs=$((osrel_offs + "$align" - osrel_offs % "$align"))
+cmdline_offs=$((osrel_offs + $(stat -Lc%s "/usr/lib/os-release")))
+cmdline_offs=$((cmdline_offs + "$align" - cmdline_offs % "$align"))
+splash_offs=$((cmdline_offs + $(stat -Lc%s "/etc/cmdline")))
+splash_offs=$((splash_offs + "$align" - splash_offs % "$align"))
+initrd_offs=$((splash_offs + $(stat -Lc%s "/dev/null")))
+initrd_offs=$((initrd_offs + "$align" - initrd_offs % "$align"))
+linux_offs=$((initrd_offs + $(stat -Lc%s "/boot/initrd.img-${version}")))
+linux_offs=$((linux_offs + "$align" - linux_offs % "$align"))
 
 objcopy \
-    --add-section .osrel="/usr/lib/os-release" --change-section-vma .osrel=0x20000 \
-    --add-section .cmdline="/etc/cmdline" --change-section-vma .cmdline=0x30000 \
-    --add-section .splash="/dev/null" --change-section-vma .splash=0x40000 \
-    --add-section .linux="${kernel}" --change-section-vma .linux=0x2000000 \
-    --add-section .initrd="/boot/initrd.img-${version}" --change-section-vma .initrd=0x3000000 \
-    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub" "/boot/unified-image.efi"
+    --add-section .osrel="/usr/lib/os-release" --change-section-vma .osrel=$(printf 0x%x $osrel_offs) \
+    --add-section .cmdline="/etc/cmdline" --change-section-vma .cmdline=$(printf 0x%x $cmdline_offs) \
+    --add-section .splash="/dev/null" --change-section-vma .splash=$(printf 0x%x $splash_offs) \
+    --add-section .initrd="/boot/initrd.img-${version}" --change-section-vma .initrd=$(printf 0x%x $initrd_offs) \
+    --add-section .linux="${kernel}" --change-section-vma .linux=$(printf 0x%x $linux_offs) \
+    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub" "/tmp/unified-image.efi"
 
-sbsign --key /etc/efi-keys/db.key --cert /etc/efi-keys/db.crt --output /boot/efi/EFI/Linux/linux-signed.efi /boot/unified-image.efi
+sbsign --key /etc/efi-keys/db.key --cert /etc/efi-keys/db.crt --output /tmp/linux-signed.efi /tmp/unified-image.efi
+mv /tmp/unified-image.efi /boot
+mv /tmp/linux-signed.efi /boot/efi/EFI/Linux
